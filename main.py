@@ -11,6 +11,7 @@ from time import time
 import threading
 import mediapipe as mp
 from glob import glob
+import csv
 
 pygame.init()
 pygame.font.init()
@@ -23,21 +24,25 @@ BATTLE_PATH = os.path.join(game_path, "assets/battle/battle.mp3")
 CRY_PATH = os.path.join(game_path, "assets/cries/")
 MASK_PATH = os.path.join(game_path, "assets/masks/coords.png")
 OPTIONS_PIC_PATH = os.path.join(game_path, "assets/battle/battle.png") 
+HAT_ANNOT_PATH = os.path.join(game_path, "assets/masks/hat_labels.csv") 
 
 # Settings for test 
-SOUND_ENABLED = False
 DEFAULT_RES = [1920,1080]
 DEFAULT_FPS = 30
-DELAY_START_TIME = 5
+DELAY_START_TIME = 15
 STAT_FREQUENCY = 3
 FLASH_FREQUENCY = 15
 FLASH_DURATION = 3
 BLACK_DURATION = 3
 RUN_CLASSIFIER = True
+RUN_OPTICAL_FLOW = True
 CRY_DELAY = 7.0
+CLASSIFIER_DELAY = 0.1
 DISPLAY_FPS = False
 RUN_BATTLE = True
-VISUALIZE_POINTS = True
+VISUALIZE_POINTS = False
+HAT_KEYPOINTS = [54, 67, 10, 297, 284]
+ADD_MASK = True
 
 class Camera():
     """ The dumb game camera / classifier class. Sets masks, gets frames, looks at your face. """
@@ -54,6 +59,17 @@ class Camera():
         self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.relevant_keypoints = []
+
+        # Optical Flow
+        self.first_frame = True
+        self.lk_params = { 
+            "winSize" : (101, 101),
+            "maxLevel" : 15,
+            "criteria": (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.001)
+        }
+        self.points_to_prev = None
+        self.sigma_dist = 50
 
         # FPS
         self.count = 0
@@ -64,6 +80,7 @@ class Camera():
         self.avg_fps = 0
 
         # Set buffers
+        self.load_mask()
         self.load_frame()
         self.frame_h, self.frame_w, _ = self.img.shape
         self.pyg_buffer = np.zeros([self.frame_w, self.frame_h, 3], dtype=np.uint8)
@@ -79,6 +96,24 @@ class Camera():
 
             # TODO: Set all of the things in the frame...
             self.frame = self.img
+
+    def load_mask(self, mask_path=MASK_PATH, hat_annot_path=HAT_ANNOT_PATH):
+        """ Switching to mediapipe because fast """
+        # Read the image
+        img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        b, g, r, self.filter_alpha = cv2.split(img)
+        self.filter_mask = cv2.merge((b, g, r))
+
+        self.mask_keypoints = {}
+        with open(hat_annot_path) as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=",")
+            for _, row in enumerate(csv_reader):
+                # skip head or empty line if it's there
+                try:
+                    x, y = int(row[1]), int(row[2])
+                    self.mask_keypoints[row[0]] = (x, y)
+                except ValueError:
+                    continue
 
 
     def set_mask(self, mask_path):
@@ -147,11 +182,35 @@ class Camera():
             self.frame = cv2.add(warped_multiplied, image_multiplied)
             self.frame = self.frame.astype("uint8")
 
+    def similarityTransform(self, inPoints, outPoints):
+        s60 = np.sin(60*np.pi/180)
+        c60 = np.cos(60*np.pi/180)
+
+        inPts = np.copy(inPoints).tolist()
+        outPts = np.copy(outPoints).tolist()
+
+        # The third point is calculated so that the three points make an equilateral triangle
+        xin = c60*(inPts[0][0] - inPts[1][0]) - s60*(inPts[0][1] - inPts[1][1]) + inPts[1][0]
+        yin = s60*(inPts[0][0] - inPts[1][0]) + c60*(inPts[0][1] - inPts[1][1]) + inPts[1][1]
+
+        inPts.append([int(xin), int(yin)])
+
+        xout = c60*(outPts[0][0] - outPts[1][0]) - s60*(outPts[0][1] - outPts[1][1]) + outPts[1][0]
+        yout = s60*(outPts[0][0] - outPts[1][0]) + c60*(outPts[0][1] - outPts[1][1]) + outPts[1][1]
+
+        outPts.append([int(xout), int(yout)])
+
+
+        # Now we can use estimateRigidTransform for calculating the similarity transform.
+        tform = cv2.estimateAffinePartial2D(np.array([inPts]), np.array([outPts]))
+        return tform[0]
+
     def mp_face_finder(self):
         selected_keypoint_indices = [127, 93, 58, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 288, 323, 356, 70, 63, 105, 66, 55,
                      285, 296, 334, 293, 300, 168, 6, 195, 4, 64, 60, 94, 290, 439, 33, 160, 158, 173, 153, 144, 398, 385,
                      387, 466, 373, 380, 61, 40, 39, 0, 269, 270, 291, 321, 405, 17, 181, 91, 78, 81, 13, 311, 306, 402, 14,
                      178, 162, 54, 67, 10, 297, 284, 389]
+
         results = self.face_mesh.process(cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB))
 
         if not results.multi_face_landmarks:
@@ -168,15 +227,53 @@ class Camera():
             keypoints = keypoints * (self.frame_w, self.frame_h)
             keypoints = keypoints.astype('int')
 
-            relevant_keypoints = []
+            self.relevant_keypoints = []
 
-            for ii in selected_keypoint_indices:
-                relevant_keypoints.append(keypoints[ii])
+            for ii in HAT_KEYPOINTS:
+                self.relevant_keypoints.append(keypoints[ii])
 
-            if VISUALIZE_POINTS:
-                for idx, point in enumerate(relevant_keypoints):
-                    cv2.circle(self.frame, point, 2, (255, 0, 0), -1)
-                    cv2.putText(self.frame, str(idx), point, cv2.FONT_HERSHEY_SIMPLEX, .3, (255, 255, 255), 1)
+        if RUN_OPTICAL_FLOW:
+            if self.first_frame:
+                self.first_frame = False
+                self.points_to_prev = np.array(self.relevant_keypoints, np.float32)
+                self.gray_prev = np.copy(self.gray)
+
+            self.points_to_next, st, err = cv2.calcOpticalFlowPyrLK(self.gray_prev, self.gray, self.points_to_prev, np.array(self.relevant_keypoints, np.float32), **self.lk_params)
+
+            # Average landmark points with detections and tracked points
+            for ii in range(0, len(self.relevant_keypoints)):
+                point = self.relevant_keypoints[ii]
+                next_point = self.points_to_next[ii]
+                dist = cv2.norm(np.array(point - next_point))
+                alpha = np.exp(-dist * dist / self.sigma_dist)
+                point = (1 - alpha) * np.array(point) + alpha * next_point
+                point = (min(max(point[0], 0), self.frame_w - 1), min(max(point[1], 0), self.frame_h - 1))
+                self.relevant_keypoints[ii] = (int(point[0]), int(point[1]))
+
+            self.points_to_prev = np.array(self.relevant_keypoints, np.float32)
+            self.gray_prev = self.gray
+
+        if VISUALIZE_POINTS:
+            for idx, point in enumerate(self.relevant_keypoints):
+                cv2.circle(self.frame, point, 2, (255, 0, 0), -1)
+                cv2.putText(self.frame, str(idx), point, cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 1)
+
+        # Apply similarity transform to input image
+        tform = self.similarityTransform(list(self.mask_keypoints.values()), self.relevant_keypoints)
+        trans_img = cv2.warpAffine(self.filter_mask, tform, (self.frame_w, self.frame_h))
+        trans_alpha = cv2.warpAffine(self.filter_alpha, tform, (self.frame_w, self.frame_h))
+        mask1 = cv2.merge((trans_alpha, trans_alpha, trans_alpha))
+ 
+        # Blur the mask before blending
+        mask1 = cv2.GaussianBlur(mask1, (3, 3), 10)
+        mask2 = (255.0, 255.0, 255.0) - mask1
+ 
+        # Perform alpha blending of the two images
+        temp1 = np.multiply(trans_img, (mask1 * (1.0 / 255)))
+        temp2 = np.multiply(self.frame, (mask2 * (1.0 / 255)))
+        if ADD_MASK:
+            self.frame = np.uint8(temp1 + temp2)
+
 
 
     def update_stats(self):
@@ -206,7 +303,6 @@ class Window():
         self.res = res
         self.mixer = pygame.mixer
         self.mixer.init(44100, -16, 1, 1024)
-        # self.mixer.init()
         self.load_assets()
         self.fps = cam.fps
         self.clock = pygame.time.Clock()
@@ -257,7 +353,7 @@ class Window():
 
 
     def start_cry(self): 
-        """ Use of POSIX threads to play some sounds """
+        """ Use of POSIX threads to play background and crying sounds """
         t = threading.Thread(name = 'cry_sound', target = self.cry_sound.play)
         t.daemon = True
         t.start()
@@ -279,7 +375,7 @@ class Window():
             self.screen.fill(pygame.Color('black'))
             self.cam.load_frame()
 
-            if RUN_CLASSIFIER and self.cam.t_elapsed > DELAY_START_TIME:
+            if RUN_CLASSIFIER and self.cam.t_elapsed > DELAY_START_TIME + FLASH_DURATION + BLACK_DURATION + CLASSIFIER_DELAY:
                 #self.cam.people_finder()
                 self.cam.mp_face_finder()
 
