@@ -29,7 +29,7 @@ HAT_ANNOT_PATH = os.path.join(game_path, "assets/masks/hat_labels.csv")
 # Settings for test 
 DEFAULT_RES = [1920,1080]
 DEFAULT_FPS = 30
-DELAY_START_TIME = 15
+DELAY_START_TIME = 10
 STAT_FREQUENCY = 3
 FLASH_FREQUENCY = 15
 FLASH_DURATION = 3
@@ -48,8 +48,10 @@ class Camera():
     """ The dumb game camera / classifier class. Sets masks, gets frames, looks at your face. """
     def __init__(self):
         """ Init and load parameters """
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FPS,DEFAULT_FPS) 
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_RES[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_RES[1])
+        self.cap.set(cv2.CAP_PROP_FPS, DEFAULT_FPS) 
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.init_battle = True
         self.eye_cache = None
